@@ -32,6 +32,19 @@ def load_test_set(path: str = TEST_SET_PATH) -> list[dict]:
         return json.load(f)
 
 
+import math
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
 def evaluate_ragas(questions: list[str], answers: list[str],
                    contexts: list[list[str]], ground_truths: list[str]) -> dict:
     """Run RAGAS evaluation."""
@@ -39,6 +52,7 @@ def evaluate_ragas(questions: list[str], answers: list[str],
         from ragas import evaluate
         from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
         from datasets import Dataset
+        from config import OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL
 
         dataset = Dataset.from_dict({
             "question": questions,
@@ -46,10 +60,36 @@ def evaluate_ragas(questions: list[str], answers: list[str],
             "contexts": contexts,
             "ground_truth": ground_truths,
         })
-        result = evaluate(
-            dataset,
-            metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-        )
+
+        eval_llm = None
+        eval_embeddings = None
+        if OPENAI_API_KEY:
+            try:
+                from langchain_openai import ChatOpenAI
+                from langchain_community.embeddings import HuggingFaceEmbeddings
+                eval_llm = ChatOpenAI(
+                    model=LLM_MODEL,
+                    api_key=OPENAI_API_KEY,
+                    base_url=OPENAI_BASE_URL if OPENAI_BASE_URL else None,
+                    max_tokens=1024,
+                    temperature=0.0,
+                    request_timeout=30.0,
+                )
+                eval_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            except Exception as e:
+                print(f"  ⚠️  Could not init custom LLM/embeddings for RAGAS: {e}")
+
+        eval_kwargs = {
+            "dataset": dataset,
+            "metrics": [faithfulness, answer_relevancy, context_precision, context_recall],
+            "raise_exceptions": False,
+        }
+        if eval_llm is not None:
+            eval_kwargs["llm"] = eval_llm
+        if eval_embeddings is not None:
+            eval_kwargs["embeddings"] = eval_embeddings
+
+        result = evaluate(**eval_kwargs)
         df = result.to_pandas()
         per_question = []
         for _, row in df.iterrows():
@@ -64,27 +104,40 @@ def evaluate_ragas(questions: list[str], answers: list[str],
                     answer=str(row.get("answer", "")),
                     contexts=ctx_list,
                     ground_truth=str(row.get("ground_truth", "")),
-                    faithfulness=float(row.get("faithfulness", 0.0) or 0.0),
-                    answer_relevancy=float(row.get("answer_relevancy", 0.0) or 0.0),
-                    context_precision=float(row.get("context_precision", 0.0) or 0.0),
-                    context_recall=float(row.get("context_recall", 0.0) or 0.0),
+                    faithfulness=_safe_float(row.get("faithfulness", 0.0)),
+                    answer_relevancy=_safe_float(row.get("answer_relevancy", 0.0)),
+                    context_precision=_safe_float(row.get("context_precision", 0.0)),
+                    context_recall=_safe_float(row.get("context_recall", 0.0)),
                 )
             )
         return {
-            "faithfulness": float(result.get("faithfulness", 0.0) or 0.0),
-            "answer_relevancy": float(result.get("answer_relevancy", 0.0) or 0.0),
-            "context_precision": float(result.get("context_precision", 0.0) or 0.0),
-            "context_recall": float(result.get("context_recall", 0.0) or 0.0),
+            "faithfulness": _safe_float(result.get("faithfulness", 0.0)),
+            "answer_relevancy": _safe_float(result.get("answer_relevancy", 0.0)),
+            "context_precision": _safe_float(result.get("context_precision", 0.0)),
+            "context_recall": _safe_float(result.get("context_recall", 0.0)),
             "per_question": per_question,
         }
     except Exception as e:
         print(f"  ⚠️  RAGAS evaluation failed: {e}")
+        per_question = [
+            EvalResult(
+                question=q,
+                answer=a,
+                contexts=c,
+                ground_truth=gt,
+                faithfulness=0.0,
+                answer_relevancy=0.0,
+                context_precision=0.0,
+                context_recall=0.0,
+            )
+            for q, a, c, gt in zip(questions, answers, contexts, ground_truths)
+        ]
         return {
             "faithfulness": 0.0,
             "answer_relevancy": 0.0,
             "context_precision": 0.0,
             "context_recall": 0.0,
-            "per_question": [],
+            "per_question": per_question,
         }
 
 
@@ -100,10 +153,10 @@ def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list
     analyzed = []
     for res in eval_results:
         metrics_dict = {
-            "faithfulness": res.faithfulness,
-            "answer_relevancy": res.answer_relevancy,
-            "context_precision": res.context_precision,
-            "context_recall": res.context_recall,
+            "faithfulness": _safe_float(res.faithfulness),
+            "answer_relevancy": _safe_float(res.answer_relevancy),
+            "context_precision": _safe_float(res.context_precision),
+            "context_recall": _safe_float(res.context_recall),
         }
         avg_score = sum(metrics_dict.values()) / 4.0
         worst_metric = min(metrics_dict, key=metrics_dict.get)
@@ -124,13 +177,14 @@ def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list
     return analyzed[:bottom_n]
 
 
-def save_report(results: dict, failures: list[dict], path: str = "ragas_report.json"):
-    """Save evaluation report to JSON. (Đã implement sẵn)"""
+def save_report(results: dict, failures: list[dict], path: str = "reports/ragas_report.json"):
+    """Save evaluation report to the reports directory."""
     report = {
         "aggregate": {k: v for k, v in results.items() if k != "per_question"},
         "num_questions": len(results.get("per_question", [])),
         "failures": failures,
     }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(f"Report saved to {path}")
